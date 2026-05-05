@@ -1,0 +1,4 @@
+requests>=2.31
+cryptography>=42
+python-dotenv>=1.0
+reportlab>=4.0
