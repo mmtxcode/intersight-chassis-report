@@ -9,10 +9,14 @@ Data flow:
     1. Authenticate to Intersight via HTTP Signature using a v3 API key
        (ECDSA P-256). See sign_headers() for the spec details.
     2. Look up the account display name (best-effort) for the report title.
-    3. Fetch all chassis (/equipment/Chasses) and all blades (/compute/Blades).
-    4. Join blades onto chassis by Moid, count slots used per chassis,
-       resolve total slot count from a model->capacity table (with an
-       observed-max fallback for unknown models).
+    3. Fetch all chassis (/equipment/Chasses), blades (/compute/Blades), and
+       PCIe nodes (/pci/Nodes — UCSX-440P X-Series GPU nodes etc.).
+    4. Join blades onto chassis directly via the EquipmentChassis ref.
+       PCIe Nodes don't reference chassis directly — they reference their
+       paired blade — so we resolve PCIe Node -> blade -> chassis in two
+       hops. Both blades and PCIe Nodes count as occupied slots. Resolve
+       total slot count from a model->capacity table (with an observed-max
+       fallback for unknown models).
     5. Render to CSV or PDF.
 
 NOTE on URL: the REST collection for equipment.Chassis is pluralized as
@@ -300,26 +304,58 @@ def fetch_all(
         skip += PAGE_SIZE
 
 
-def attach_blades(chassis_list: list, blades: list) -> None:
-    """Group blades onto their parent chassis by Moid (mutates in place).
-
-    Each blade carries a relationship object that points at its chassis:
-        {"EquipmentChassis": {"Moid": "<chassis-moid>", "ObjectType": ...}}
-    We do this join client-side rather than via $expand=Blades because
-    $expand can require additional permissions on the expanded type.
-    """
-    # Bucket blades by chassis Moid in one pass.
+def _bucket_by_chassis(items: list) -> dict:
+    """Group MOs by their parent chassis Moid, given an EquipmentChassis ref."""
     by_chassis = defaultdict(list)
-    for blade in blades:
-        # Some Intersight responses use "Chassis" as the key instead of
-        # "EquipmentChassis"; check both for forward compatibility.
-        ref = blade.get("EquipmentChassis") or blade.get("Chassis") or {}
+    for item in items:
+        # Some Intersight responses use "Chassis" instead of "EquipmentChassis";
+        # check both for forward compatibility.
+        ref = item.get("EquipmentChassis") or item.get("Chassis") or {}
         moid = ref.get("Moid") if isinstance(ref, dict) else None
         if moid:
-            by_chassis[moid].append(blade)
-    # Attach the bucket to each chassis. Empty list for chassis with no blades.
+            by_chassis[moid].append(item)
+    return by_chassis
+
+
+def attach_occupants(chassis_list: list, blades: list, pcie_nodes: list) -> None:
+    """Attach blades and PCIe nodes onto their parent chassis (mutates).
+
+    Blades reference their chassis directly via the EquipmentChassis field.
+    PCIe Nodes (pci.Node MOs, e.g., UCSX-440P) do NOT — they reference their
+    paired compute.Blade via the ComputeBlade field, and only that blade
+    knows its chassis. So we join in two hops: pci.Node -> blade -> chassis.
+
+    Both blades AND PCIe nodes occupy chassis slots in X-Series. A chassis
+    with 5 blades plus 2 PCIe nodes has 7 slots used, not 5 — that's the bug
+    this function fixes.
+    """
+    # Direct: blades are bucketed by their EquipmentChassis ref.
+    blade_buckets = _bucket_by_chassis(blades)
+
+    # Indirect: build blade-Moid -> chassis-Moid lookup, then resolve each
+    # PCIe Node's chassis through its paired blade.
+    blade_to_chassis = {}
+    for blade in blades:
+        ref = blade.get("EquipmentChassis") or blade.get("Chassis") or {}
+        chassis_moid = ref.get("Moid") if isinstance(ref, dict) else None
+        blade_moid = blade.get("Moid")
+        if blade_moid and chassis_moid:
+            blade_to_chassis[blade_moid] = chassis_moid
+
+    pcie_buckets = defaultdict(list)
+    for node in pcie_nodes:
+        # PCIe Node points at its paired blade. Try ComputeBlade first
+        # (canonical), fall back to Parent (same Moid in practice).
+        parent_ref = node.get("ComputeBlade") or node.get("Parent") or {}
+        blade_moid = parent_ref.get("Moid") if isinstance(parent_ref, dict) else None
+        chassis_moid = blade_to_chassis.get(blade_moid) if blade_moid else None
+        if chassis_moid:
+            pcie_buckets[chassis_moid].append(node)
+
     for c in chassis_list:
-        c["Blades"] = by_chassis.get(c.get("Moid"), [])
+        moid = c.get("Moid")
+        c["Blades"] = blade_buckets.get(moid, [])
+        c["PcieNodes"] = pcie_buckets.get(moid, [])
 
 
 def capacity_by_model(chassis_list: list) -> dict:
@@ -334,12 +370,22 @@ def capacity_by_model(chassis_list: list) -> dict:
     Returns {model: total_slots}. Models with neither source are absent
     from the result; build_rows() emits "?" for those rows.
     """
-    # First pass: find the max SlotId per model across all blades in the fleet.
+    # First pass: find the max SlotId per model across all occupants (blades
+    # AND PCIe nodes) in the fleet. PCIe nodes share the same slot space as
+    # blades in X-Series chassis, so they must be considered too.
+    #
+    # SlotId types differ by MO: blade.SlotId is int, pci.Node.SlotId is str.
+    # Normalize to int defensively so the comparison doesn't raise.
     observed = defaultdict(int)
     for chassis in chassis_list:
         model = chassis.get("Model") or "Unknown"
-        for blade in chassis.get("Blades") or []:
-            slot = blade.get("SlotId") or 0
+        occupants = (chassis.get("Blades") or []) + (chassis.get("PcieNodes") or [])
+        for occupant in occupants:
+            raw = occupant.get("SlotId")
+            try:
+                slot = int(raw) if raw is not None else 0
+            except (ValueError, TypeError):
+                slot = 0
             if slot > observed[model]:
                 observed[model] = slot
 
@@ -365,8 +411,12 @@ def build_rows(chassis_list: list, capacity: dict) -> list:
     rows = []
     for c in chassis_list:
         model = c.get("Model") or "Unknown"
+        # "Used" is the total of blade slots + PCIe-node slots — both occupy
+        # the same physical slot pool and prevent further servers from being
+        # racked there.
         blades = c.get("Blades") or []
-        used = len(blades)
+        pcie_nodes = c.get("PcieNodes") or []
+        used = len(blades) + len(pcie_nodes)
         total = capacity.get(model, 0)
         # Defensive: a chassis with more blades than our table allows means
         # the table is wrong — believe the live data instead of the table.
@@ -567,8 +617,40 @@ def main() -> int:
     )
     print(f"  {len(blades)} blades returned.", file=sys.stderr)
 
+    print("Fetching PCIe nodes ...", file=sys.stderr)
+    # X-Series PCIe Nodes (e.g., UCSX-440P GPU nodes) occupy real compute
+    # slots and must be counted alongside blades. They live under pci.Node
+    # at /api/v1/pci/Nodes — note the unusual /pci/ namespace.
+    #
+    # Important: pci.Nodes do NOT carry an EquipmentChassis ref. They link
+    # to their paired compute blade via ComputeBlade, and we resolve the
+    # chassis through the blade in attach_occupants(). The chassis MO has
+    # a PciNodes relationship, but it's empty because RBAC filters PCIe
+    # Node items out of relationship arrays — direct read at /pci/Nodes
+    # is the only way to see them under this role.
+    #
+    # Wrapped in try/except so a 403 here doesn't kill the report —
+    # it just under-reports usage.
+    try:
+        pcie_nodes = fetch_all(
+            base_url,
+            "/api/v1/pci/Nodes",
+            {"$select": "Moid,SlotId,Model,ComputeBlade"},
+            key_id,
+            private_key,
+            debug=args.debug,
+        )
+        print(f"  {len(pcie_nodes)} PCIe nodes returned.", file=sys.stderr)
+    except RuntimeError as e:
+        print(
+            f"  WARNING: PCIe-node fetch failed ({e}). Slots occupied by "
+            f"PCIe nodes will be under-reported.",
+            file=sys.stderr,
+        )
+        pcie_nodes = []
+
     # --- 5. Compute the report ---
-    attach_blades(chassis, blades)
+    attach_occupants(chassis, blades, pcie_nodes)
     capacity = capacity_by_model(chassis)
     if capacity:
         # Print resolved capacity per model — handy when verifying that an
