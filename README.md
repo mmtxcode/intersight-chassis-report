@@ -18,9 +18,7 @@ Output formats: CSV or PDF.
 8. [Required Intersight permissions](#required-intersight-permissions)
 9. [Slot capacity configuration](#slot-capacity-configuration)
 10. [How it works](#how-it-works)
-11. [Troubleshooting](#troubleshooting)
-12. [API quirks](#api-quirks)
-13. [Project layout](#project-layout)
+11. [Project layout](#project-layout)
 
 ---
 
@@ -128,9 +126,6 @@ python chassis_report.py [--format {csv,pdf}] [-o OUTPUT] [--env-file ENV_FILE] 
 # CSV to a file
 python chassis_report.py --format csv -o chassis.csv
 
-# CSV to stdout (pipe-friendly)
-python chassis_report.py --format csv | column -t -s,
-
 # PDF
 python chassis_report.py --format pdf -o chassis.pdf
 
@@ -236,53 +231,6 @@ Each request is signed with the API key per [draft-cavage-http-signatures-12](ht
 ### Two-hop chassis join for PCIe Nodes
 
 `pci.Node` MOs do not carry an `EquipmentChassis` reference. Each one references its X-Fabric-paired `compute.Blade` via `ComputeBlade`. To bucket PCIe Nodes by chassis, the script first builds a `blade_moid → chassis_moid` map from the blades it already fetched, then resolves each PCIe Node's chassis through its paired blade. See `attach_occupants()` for details.
-
----
-
-## Troubleshooting
-
-### `403 InvalidUrl / iam_invalid_method_operation`
-
-Despite the `InvalidUrl` code, this can mean either a genuinely wrong URL **or** an authentication / signature problem (Intersight's IAM layer returns this for both). When in doubt:
-
-1. Confirm the URL path is correct. The collection paths are irregular in places — see [API quirks](#api-quirks).
-2. Confirm the role on the API key permits the operation.
-3. Run with `--debug` and check that the URL Authorization header reaches the API; if it does, the signature is being rejected.
-
-### `401 AuthenticationFailure / iam_api_key_is_invalid`
-
-Signature validation failed. Causes, in order of likelihood:
-
-- The `.pem` file does not correspond to the public key registered for the API Key ID. Re-download the key from Intersight and confirm the API Key ID in `.env` matches.
-- Clock skew. Intersight rejects signatures more than ~15 minutes off UTC. Run `date -u` and verify against an external clock.
-- The signing format is wrong. (The script handles this correctly; only relevant if you've modified `sign_headers()`.)
-
-### Chassis row shows `?` in Total / Available
-
-The chassis model is not in `KNOWN_CAPACITY` and no blade has ever been observed in a slot of that model. Add the model to the table.
-
-### A chassis shows fewer "used" slots than reality
-
-If you have X-Series chassis with X440p (or other PCIe Node) hardware and the count is low, verify the role includes `pci.Node` reads. The stderr line `N PCIe nodes returned.` should be non-zero in fleets that have them.
-
-### `ValueError: Could not deserialize key data ... ASN.1 parsing error`
-
-The `.pem` file's header (`-----BEGIN ... PRIVATE KEY-----`) does not match its body's actual encoding. The script's `load_private_key()` includes a fallback that recovers from this automatically. If you still hit it, either the file is corrupted or it's not actually a private key — re-download from Intersight.
-
----
-
-## API quirks
-
-A few non-obvious facts about the Intersight API that this script accommodates:
-
-- **`equipment.Chassis` collection URL is `/api/v1/equipment/Chasses`**, not `/api/v1/equipment/Chassis`. The MO type name is singular but the URL is irregularly pluralized. The singular form returns `403 InvalidUrl`.
-- **`pci.Node` lives at `/api/v1/pci/Nodes`** — not under `/equipment/` or `/compute/` like its peers. The `/pci/` namespace is rarely used elsewhere.
-- **PCIe Nodes do not expose an `EquipmentChassis` reference**. They reference their X-Fabric-paired blade via `ComputeBlade` instead, requiring a two-hop join to associate them with their chassis.
-- **The `equipment.Chassis.PciNodes` relationship array is RBAC-filtered to empty under the Read-Only role**, even when the underlying `pci.Node` MOs are accessible at `/api/v1/pci/Nodes`. Direct collection read is the only path that works for non-admin keys.
-- **`pci.Node.SlotId` is a string**, while `compute.Blade.SlotId` is an int. Coerce defensively when comparing.
-- **HTTP Signature ECDSA is DER-encoded**, not raw r‖s (IEEE P1363). The literal hs2019 spec calls for raw, but Intersight's verifier rejects raw with `iam_api_key_is_invalid`.
-- **`Content-Type: application/json` must be in the signed-headers list** even on GET requests with no body. Cisco's auth-docs example includes it; omitting it works inconsistently.
-- **`/api/v1/iam/Accounts/<moid>` direct GET often succeeds** for non-admin keys even though listing the same collection is denied. Read-by-Moid and list have different permission semantics in Intersight.
 
 ---
 
