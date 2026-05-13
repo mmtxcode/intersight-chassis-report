@@ -175,18 +175,21 @@ The built-in **Read-Only** role grants all of these. If a custom role is in use 
 
 ## Slot capacity configuration
 
-The script needs to know how many slots each chassis model has. Intersight does not expose this on the chassis MO, so the script consults two sources, in order:
+The script needs to know how many slots each chassis model has. Intersight does not expose this as a structured field on the chassis MO, so the script consults three sources, in order:
 
-1. **`KNOWN_CAPACITY` table** in `chassis_report.py`:
-   ```python
-   KNOWN_CAPACITY = {
-       "UCSX-9508":     8,  # X-Series chassis
-       "UCSB-5108-AC2": 8,  # 8 half-width slots (or 4 full-width)
-   }
-   ```
-2. **Observed-max heuristic** — for models absent from the table, the highest `SlotId` ever observed across the fleet is used. This is a lower bound: if no chassis of a given model is fully populated, capacity will be under-reported.
+1. **`KNOWN_CAPACITY` manual override** in `chassis_report.py` — empty by default. Add an entry only when source 2 produces the wrong value for a specific model.
+2. **Parsed `Description` string** — each chassis carries a Description like `"Cisco Blade Server Chassis, 7U with Eight Vertical Blade Slots"`. The script extracts the slot count from this text automatically. This is the primary path and works for every Cisco chassis we've seen, including new models that aren't in the override table.
+3. **Observed-max heuristic** — for chassis where the Description has no recognizable slot count, the highest `SlotId` ever observed across the fleet is used. This is a lower bound: if no chassis of that model is fully populated, capacity will be under-reported.
 
-If a row shows `?` in the Total / Available columns, the model is unknown to the table *and* no occupant has ever been observed in any slot. Add the model to `KNOWN_CAPACITY` to fix.
+The stderr output during a run shows which source each model resolved from:
+
+```
+Slot capacity by model: UCSB-5108-AC2=8 (Description), UCSX-9508=8 (Description)
+```
+
+A value of `(override)` or `(observed max)` in that line tells you the script fell back to source 1 or 3 respectively. If a row in the report shows `?` in the Total / Available columns, no source produced a value — typically a brand-new chassis model whose Description didn't parse and which has no occupants yet. Add the model to `KNOWN_CAPACITY` to fix.
+
+The parser caps recognized slot counts at `MAX_PLAUSIBLE_SLOTS = 8` (the maximum across all current Cisco chassis). Numbers above this in a Description are treated as noise — typically product numbers like `5108` or `9508` that appear in the same sentence. Raise this constant if Cisco ever ships a chassis with more compute slots.
 
 ---
 

@@ -59,14 +59,64 @@ DEFAULT_BASE_URL = "https://intersight.com"
 # debug logs at a manageable size while still being efficient.
 PAGE_SIZE = 100
 
-# Total slots per chassis model. Intersight does NOT expose total slot count
-# on the equipment.Chassis MO, so we keep our own table here. If a chassis
-# model isn't in this table, the report falls back to the highest SlotId
-# observed across the fleet (a lower bound — see capacity_by_model()).
-KNOWN_CAPACITY = {
-    "UCSX-9508":     8,  # X-Series chassis
-    "UCSB-5108-AC2": 8,  # 8 half-width slots (or 4 full-width)
+# Manual capacity overrides. Normally not needed: the script reads the slot
+# count from each chassis's Description string ("...with Eight Vertical Blade
+# Slots") automatically. Add an entry here only when you need to force a
+# specific value — e.g., a chassis whose Description omits the slot count, or
+# where Cisco's wording is ambiguous.
+KNOWN_CAPACITY: dict[str, int] = {
 }
+
+# Sanity cap when parsing slot counts from a chassis Description. All Cisco
+# chassis currently ship with 8 compute slots maximum (UCS 5108 = 8 half-width,
+# UCSX-9508 = 8 vertical). Any parsed number above this is treated as noise
+# (product numbers like 5108/9508 often appear in the same sentence and would
+# otherwise be picked up). If Cisco ever ships a larger chassis, raise this.
+MAX_PLAUSIBLE_SLOTS = 8
+
+# English number words used when parsing Description strings — Cisco writes
+# slot counts as words ("Eight Vertical Blade Slots"), not digits.
+NUMBER_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8,
+}
+
+_NUMBER_RE = re.compile(
+    r"\b(\d+|" + "|".join(NUMBER_WORDS) + r")\b", re.IGNORECASE
+)
+_SLOT_KEYWORD_RE = re.compile(r"\b(?:blade|slots?)\b", re.IGNORECASE)
+
+
+def slot_count_from_description(desc):
+    """Extract slot count from a chassis Description string.
+
+    Strategy: for every 'blade' or 'slot(s)' keyword in the text, look back
+    up to 60 chars and grab every plausible number (digit or English word).
+    Filter values > MAX_PLAUSIBLE_SLOTS so we don't pick up product numbers
+    like '5108' or '9508' that appear in the same sentence. Return the
+    maximum candidate.
+
+    Returns None if the description is missing or has no recognizable count.
+    The maximum (not minimum) is used because chassis supporting both
+    half-width and full-width modes (e.g., UCS 5108: "Eight half-width OR
+    four full-width") report multiple numbers, and the physical slot count
+    is the larger one.
+    """
+    if not desc:
+        return None
+    text = desc.lower()
+    candidates = []
+    for kw in _SLOT_KEYWORD_RE.finditer(text):
+        preceding = text[max(0, kw.start() - 60):kw.start()]
+        # Collect every plausible number in the window — not just the last
+        # one — so multi-mode chassis ("Eight half-width or Four full-width")
+        # contribute both candidates and max() picks the larger.
+        for num_str in _NUMBER_RE.findall(preceding):
+            token = num_str.lower()
+            n = int(token) if token.isdigit() else NUMBER_WORDS[token]
+            if 1 <= n <= MAX_PLAUSIBLE_SLOTS:
+                candidates.append(n)
+    return max(candidates) if candidates else None
 
 
 def load_private_key(path: str):
@@ -361,26 +411,37 @@ def attach_occupants(chassis_list: list, blades: list, pcie_nodes: list) -> None
 def capacity_by_model(chassis_list: list) -> dict:
     """Determine total slot count per chassis model.
 
-    Two sources, in priority order:
-      1. KNOWN_CAPACITY table — the authoritative answer.
-      2. Highest SlotId observed across the fleet for that model — a lower
-         bound. Useful only when at least one chassis of that model has a
-         blade in its top slot.
+    Three sources, in priority order:
+      1. KNOWN_CAPACITY — manual override (rarely needed).
+      2. Description parsing — reads the chassis Description string
+         ("...with Eight Vertical Blade Slots"). This is the primary
+         path; it works for every Cisco chassis we've seen, including
+         models that aren't in the override table.
+      3. Observed-max — highest SlotId seen across the fleet for that
+         model. A lower bound; only correct when at least one chassis
+         is populated up to its top slot.
 
-    Returns {model: total_slots}. Models with neither source are absent
-    from the result; build_rows() emits "?" for those rows.
+    Returns {model: (total_slots, source_label)}. Models for which no
+    source produces a value are absent from the dict, and build_rows()
+    emits '?' for those rows.
     """
-    # First pass: find the max SlotId per model across all occupants (blades
-    # AND PCIe nodes) in the fleet. PCIe nodes share the same slot space as
-    # blades in X-Series chassis, so they must be considered too.
-    #
-    # SlotId types differ by MO: blade.SlotId is int, pci.Node.SlotId is str.
-    # Normalize to int defensively so the comparison doesn't raise.
+    # Description-derived capacity per model (use the first chassis of
+    # each model that yields a parseable value).
+    desc_capacity = {}
+    for c in chassis_list:
+        model = c.get("Model") or "Unknown"
+        if model in desc_capacity:
+            continue
+        n = slot_count_from_description(c.get("Description"))
+        if n:
+            desc_capacity[model] = n
+
+    # Observed-max per model from blades + PCIe nodes. SlotId types differ
+    # by MO (blade=int, pci.Node=str), so normalize defensively.
     observed = defaultdict(int)
     for chassis in chassis_list:
         model = chassis.get("Model") or "Unknown"
-        occupants = (chassis.get("Blades") or []) + (chassis.get("PcieNodes") or [])
-        for occupant in occupants:
+        for occupant in (chassis.get("Blades") or []) + (chassis.get("PcieNodes") or []):
             raw = occupant.get("SlotId")
             try:
                 slot = int(raw) if raw is not None else 0
@@ -389,20 +450,23 @@ def capacity_by_model(chassis_list: list) -> dict:
             if slot > observed[model]:
                 observed[model] = slot
 
-    # Second pass: pick the best source for each distinct model present.
+    # Resolve per model.
     capacity = {}
     for model in {c.get("Model") or "Unknown" for c in chassis_list}:
-        known = KNOWN_CAPACITY.get(model)
-        seen = observed.get(model, 0)
-        if known and seen > known:
-            # Real data exceeds our table — trust the data and let the user
-            # update KNOWN_CAPACITY. (Should not happen for healthy fleets.)
-            capacity[model] = seen
-        elif known:
-            capacity[model] = known
-        elif seen:
-            capacity[model] = seen
-        # else: unknown model with no observed blades → omit, row shows "?"
+        if model in KNOWN_CAPACITY:
+            capacity[model] = (KNOWN_CAPACITY[model], "override")
+        elif model in desc_capacity:
+            capacity[model] = (desc_capacity[model], "Description")
+        elif observed[model] > 0:
+            capacity[model] = (observed[model], "observed max")
+        # else: model has no source — omit, row shows '?'
+
+        # Defensive: if real data exceeds whatever source we chose, the
+        # source is wrong — trust the data.
+        if model in capacity:
+            total, source = capacity[model]
+            if observed[model] > total:
+                capacity[model] = (observed[model], f"observed (> {source})")
     return capacity
 
 
@@ -417,7 +481,9 @@ def build_rows(chassis_list: list, capacity: dict) -> list:
         blades = c.get("Blades") or []
         pcie_nodes = c.get("PcieNodes") or []
         used = len(blades) + len(pcie_nodes)
-        total = capacity.get(model, 0)
+        # capacity values are (total_slots, source_label) tuples.
+        entry = capacity.get(model)
+        total = entry[0] if entry else 0
         # Defensive: a chassis with more blades than our table allows means
         # the table is wrong — believe the live data instead of the table.
         if total and used > total:
@@ -596,7 +662,7 @@ def main() -> int:
     chassis = fetch_all(
         base_url,
         "/api/v1/equipment/Chasses",
-        {"$select": "Moid,Name,Model,Serial"},
+        {"$select": "Moid,Name,Model,Serial,Description"},
         key_id,
         private_key,
         debug=args.debug,
@@ -653,10 +719,10 @@ def main() -> int:
     attach_occupants(chassis, blades, pcie_nodes)
     capacity = capacity_by_model(chassis)
     if capacity:
-        # Print resolved capacity per model — handy when verifying that an
-        # unfamiliar model is being recognized correctly.
-        models = ", ".join(f"{m}={n}" for m, n in sorted(capacity.items()))
-        print(f"  Slot capacity by model: {models}", file=sys.stderr)
+        # Print resolved capacity per model with the source — handy when
+        # verifying that an unfamiliar model is being recognized correctly.
+        parts = [f"{m}={n} ({src})" for m, (n, src) in sorted(capacity.items())]
+        print(f"  Slot capacity by model: {', '.join(parts)}", file=sys.stderr)
 
     rows = build_rows(chassis, capacity)
 
