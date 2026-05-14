@@ -146,12 +146,14 @@ python chassis_report.py --format csv -o chassis.csv --debug
 
 ## Launcher script
 
-`intersight-report.sh` is a Bash launcher that validates the environment, builds/refreshes the virtual environment, verifies API connectivity, and presents an interactive menu. Use it when you want a guided run or as a single entry point on a shared workstation.
+The repo ships with a launcher that validates the environment, builds/refreshes the virtual environment, verifies API connectivity, and presents an interactive menu. Two equivalent entry points:
 
-```bash
-chmod +x intersight-report.sh   # one-time
-./intersight-report.sh
-```
+| OS | Entry point | How to run |
+| --- | --- | --- |
+| macOS / Linux | `intersight-report.sh` | `chmod +x intersight-report.sh` (one-time), then `./intersight-report.sh` |
+| Windows | `intersight-report.bat` *(or `intersight-report.ps1` directly)* | Double-click `intersight-report.bat`, or from PowerShell: `.\intersight-report.ps1` |
+
+On Windows, double-clicking the `.bat` wrapper invokes the `.ps1` with `-ExecutionPolicy Bypass` for that single run, so users do not need to change the system-wide execution policy. The wrapper also keeps the console window open after the launcher exits.
 
 ### What the launcher does
 
@@ -192,8 +194,9 @@ The menu loops until the user picks `0`, so multiple reports can be generated in
 
 ### Notes
 
-- The launcher is Bash; on macOS and Linux it runs natively. On Windows use WSL or Git Bash, or run `chassis_report.py` directly.
 - Re-running the launcher always validates and updates the venv, so adding a dependency to `requirements.txt` and re-running is enough to pull it in.
+- The Bash and PowerShell launchers are functionally equivalent and produce identical output filenames.
+- On Windows, `intersight-report.ps1` can also be run directly from any PowerShell prompt: `.\intersight-report.ps1`. If you see "running scripts is disabled on this system", either use the `.bat` wrapper or run once with: `powershell.exe -ExecutionPolicy Bypass -File .\intersight-report.ps1`.
 
 ---
 
@@ -297,7 +300,9 @@ Each request is signed with the API key per [draft-cavage-http-signatures-12](ht
 .
 ├── chassis_report.py     # Main script — generates the CSV/PDF report
 ├── preflight.py          # Connection check used by the launcher
-├── intersight-report.sh  # Bash launcher with preflight + interactive menu
+├── intersight-report.sh  # Launcher (Bash) — macOS / Linux entry point
+├── intersight-report.ps1 # Launcher (PowerShell) — Windows entry point
+├── intersight-report.bat # Double-click wrapper for the .ps1 on Windows
 ├── requirements.txt      # Python dependencies
 ├── .env.example          # Configuration template
 ├── .gitignore            # Excludes .env, *.pem, *.csv, *.pdf, venv/, __pycache__/
