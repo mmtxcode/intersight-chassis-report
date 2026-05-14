@@ -14,11 +14,12 @@ Output formats: CSV or PDF.
 4. [API key setup](#api-key-setup)
 5. [Configuration](#configuration)
 6. [Usage](#usage)
-7. [Sample output](#sample-output)
-8. [Required Intersight permissions](#required-intersight-permissions)
-9. [Slot capacity configuration](#slot-capacity-configuration)
-10. [How it works](#how-it-works)
-11. [Project layout](#project-layout)
+7. [Launcher script](#launcher-script)
+8. [Sample output](#sample-output)
+9. [Required Intersight permissions](#required-intersight-permissions)
+10. [Slot capacity configuration](#slot-capacity-configuration)
+11. [How it works](#how-it-works)
+12. [Project layout](#project-layout)
 
 ---
 
@@ -143,6 +144,59 @@ python chassis_report.py --format csv -o chassis.csv --debug
 
 ---
 
+## Launcher script
+
+`intersight-report.sh` is a Bash launcher that validates the environment, builds/refreshes the virtual environment, verifies API connectivity, and presents an interactive menu. Use it when you want a guided run or as a single entry point on a shared workstation.
+
+```bash
+chmod +x intersight-report.sh   # one-time
+./intersight-report.sh
+```
+
+### What the launcher does
+
+Before showing the menu, it runs four preflight checks in order. Any failure stops the launcher with a specific error so the user can fix it before retrying:
+
+1. **Locates a Python interpreter** ≥ 3.10 (`python3.13`, `python3.12`, … in PATH).
+2. **Prepares the virtual environment** at `.venv` — creates it if missing, installs / updates everything in `requirements.txt`.
+3. **Verifies the `.env` file** exists at the expected location.
+4. **Tests the Intersight API connection** by reading the account by Moid, and captures the account display name for use in output filenames.
+
+### Menu
+
+After preflight, the launcher shows a top-level menu:
+
+```
+===== Intersight Reports =====
+  1) Chassis Inventory Report
+  0) Exit
+```
+
+Choosing `1` opens the chassis-report submenu:
+
+```
+===== Chassis Inventory Report =====
+  Account     : ACME Corp Lab
+  Output dir  : /path/to/intersight-chassis-report
+  File prefix : ACME-Corp-Lab-chassis-report
+
+  1) Generate CSV
+  2) Generate PDF
+  3) Generate both
+  0) Back to main menu
+```
+
+Output files are named `<account-name>-chassis-report.csv` and / or `<account-name>-chassis-report.pdf`, where the account name is sanitized (any character outside `A-Z`, `a-z`, `0-9`, `.`, `_`, `-` is replaced with `-`) so the filename is portable across operating systems.
+
+The menu loops until the user picks `0`, so multiple reports can be generated in one session without re-running preflight.
+
+### Notes
+
+- The launcher is Bash; on macOS and Linux it runs natively. On Windows use WSL or Git Bash, or run `chassis_report.py` directly.
+- Re-running the launcher always validates and updates the venv, so adding a dependency to `requirements.txt` and re-running is enough to pull it in.
+
+---
+
 ## Sample output
 
 ```
@@ -241,7 +295,9 @@ Each request is signed with the API key per [draft-cavage-http-signatures-12](ht
 
 ```
 .
-├── chassis_report.py     # Main script
+├── chassis_report.py     # Main script — generates the CSV/PDF report
+├── preflight.py          # Connection check used by the launcher
+├── intersight-report.sh  # Bash launcher with preflight + interactive menu
 ├── requirements.txt      # Python dependencies
 ├── .env.example          # Configuration template
 ├── .gitignore            # Excludes .env, *.pem, *.csv, *.pdf, venv/, __pycache__/
