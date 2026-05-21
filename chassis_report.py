@@ -571,6 +571,13 @@ def write_pdf(rows: list, path: str, title: str) -> None:
     data = [CSV_HEADER] + [_row_values(r) for r in rows]
 
     # Table style — coordinates are (col, row); -1 means "last".
+    # Column index map (matches CSV_HEADER):
+    #   0  Name
+    #   1  Model
+    #   2  Serial
+    #   3  Slots Total       <- numeric, right-aligned
+    #   4  Slots Used        <- numeric, right-aligned
+    #   5  Slots Available   <- numeric, right-aligned
     table = Table(data, repeatRows=1, hAlign="LEFT")
     style = TableStyle(
         [
@@ -578,7 +585,7 @@ def write_pdf(rows: list, path: str, title: str) -> None:
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E78")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            # Numeric columns (Slots Total/Used/Available, indices 3-5) right-aligned.
+            # Numeric summary columns right-aligned.
             ("ALIGN", (3, 1), (-1, -1), "RIGHT"),
             # Thin grid + alternating row stripe for readability.
             ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
